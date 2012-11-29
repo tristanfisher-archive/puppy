@@ -1,0 +1,215 @@
+#!/usr/bin/env python
+
+import datetime as dt
+import time
+import os
+import sys
+import re
+import argparse
+import subprocess
+from subprocess import call
+import socket
+#keep it in stdlib for single file portability
+import urllib
+import urllib2
+
+#TODO: avoid TOCTTOC issue by doing a EAFP handler instead
+
+###############
+#bootstrapping#
+###############
+#2.6.6. should be bare minimum (released 2010)
+scriptVersion = '0.06-beta'
+minPyVersion = (2,6,6)
+boxPyVersion = sys.version_info
+if boxPyVersion < minPyVersion:
+    sys.stderr.write("You need at least python v{0} to use this script".format(minPyVersion))
+    exit(1)
+
+currentUser = os.getenv("SUDO_USER") or os.getenv("USER") or 'unknown user'
+strTime = str(dt.datetime.now())
+#Change later when adding remote host support
+myHost = str(socket.gethostname())
+
+#Puppet uses a lock file to track enable/disable state
+myLockFile = '/var/lib/puppet/state/puppetdlock'
+myResurrectFile = '/var/lib/puppet/state/puppetd_resume_date'
+
+#subprocess.call("which puppetd") could return either the path, an alias response, or 'no such'
+#emulate via py instead:
+myFile = 'puppetd'
+def which(myFile):
+    def isExecutable(myFilePath):
+        return os.path.isfile(myFilePath) and os.access(myFilePath, os.X_OK)
+
+    myFilePath,fileName = os.path.split(myFile)
+
+    if myFilePath and isExecutable(myFile):
+        return myFile
+    else:
+        for path in os.environ["PATH"].split(os.pathsep):
+            exe_file = os.path.join(path,myFile)
+            if isExecutable(exe_file):
+                return exe_file
+    return None
+
+#quick check that puppetd exists
+myPuppetd = which('puppetd')
+if not myPuppetd:
+    print("puppetd is not in your $PATH")
+    sys.exit(1)
+
+def write_check():
+    if os.access('/etc/motd', os.W_OK): pass
+    else: sys.exit("Please ensure that /etc/motd is writable by {0}.  Similarly, you might want to run this under sudo".format(currentUser))
+
+################
+#puppy features#
+################
+
+def show_version():
+    print("%s" % (scriptVersion))
+    exit(0)
+
+def write_motd(myContent):
+    with open('/etc/motd', 'w') as myMotd:
+        myMotd.write(myContent)
+
+def enable_puppet():
+
+    write_check()
+
+    if os.access(myLockFile,os.W_OK): pass
+    else: sys.exit("{0} not found.  puppet might not be disabled.".format(myLockFile))
+
+    #make sure enable_puppet() rm'd the lockfile
+    if os.access(myLockFile, os.W_OK):
+        call("puppetd --enable", shell=True)
+        #make sure lockfile got dropped
+        if not os.access(myLockFile, os.R_OK): pass
+        else:
+            try:
+                os.remove(myLockFile)
+            except:
+                sys.exit("Failed to manually remove {0}.  Try sudo.".format(myLockFile))
+        write_motd("\n")
+
+    else: sys.exit("{0} is not writeable/removable by the current user.  Try sudo".format(myLockFile))
+
+    #remoteAPI = 'http://example.org/api'
+    #opener = urllib2.build_opener(urllib2.HTTPHandler)
+    #myReq = urllib2.Request('%s', data = '{"message": "Puppet enabled on %s", "type": "puppet"}' % (remoteAPI, myHost))
+    #myReq.add_header('Content-Type', 'application/json')
+    #myReq.get_method = lambda: 'PUT'
+    #url = opener.open(myReq)
+    #print("Puppet enabled!\n")
+
+def disable_puppet(myExcuse,myHost,myTimeout='1'):
+
+    write_check()
+
+    #argparse does not handle string='' test case; just in case nargs="+" falls through:
+    #if myExcuse.isspace() or not myExcuse or myExcuse.__len__() <= 2:
+    #    sys.exit("You can't leave an empty excuse")
+    #Some versions of python interpret the arg as a list.  .isspace() methods blow up for this.
+    if not myExcuse:
+        sys.exit("You can't leave an empty excuse")
+
+    else:
+        #Don't check for existing file.  Setting a new disable date shouldn't come at the cost of re-enabling.
+        call("puppetd --disable '%s'" % myExcuse, shell=True)
+        if os.access(myLockFile, os.W_OK): pass
+        else: sys.exit("{0} failed to create.  try sudo?".format(myLockFile))
+
+
+        #Time puppet was disabled is obtained from the metadata (mtime) of the lockfile.
+        #Store desired resurrectTime in a file for --agent reading:
+        epochNow = time.mktime(dt.datetime.now().timetuple())
+        #days * 86,400 (number of seconds per day)
+        myEpochTimeout = myTimeout * 86400
+
+        #write needs a string
+        with open(myResurrectFile, 'w') as myResurrectFilefh:
+            myResurrectFilefh.write(str(epochNow + myEpochTimeout))
+
+        if os.access(myResurrectFile, os.R_OK): pass
+        else: sys.exit("{0} failed to create.  try sudo?".format(myResurrectFile))
+
+
+        #Split into multiple lines for readability
+        #remoteAPI = 'http://example.org/api'
+        #myMessage = "Puppet disabled on %s for the reason: %s" % ( myHost, myExcuse )
+        #opener = urllib2.build_opener(urllib2.HTTPHandler)
+        #myReq = urllib2.Request('remoteAPI', data = '{"message": " %s ", "type": "puppet"}' % (remoteAPI, myMessage))
+        #myReq.add_header('Content-Type', 'application/json')
+        #myReq.get_method = lambda: 'PUT'
+        #url = opener.open(myReq)
+
+        write_motd("#Puppet was disabled on %s by %s for the following reason: %s \n" % (strTime, currentUser, myExcuse))
+        print("Puppet disabled with the excuse: %s" %(myExcuse))
+
+def agent():
+    #this is the cron script that checks if puppet should be renabled
+
+    if os.access(myLockFile,os.R_OK): pass
+    else: sys.exit("{0} failed to be read.".format(myLockFile))
+
+    if os.access(myResurrectFile,os.R_OK):pass
+    else: sys.exit("{0} failed to be read.".format(myResurrectFile))
+
+    disableEpochTime = os.stat(myLockFile).st_mtime
+    epochNow = time.mktime(dt.datetime.now().timetuple())
+    timeDelta = epochNow - disableEpochTime
+
+    with open(myResurrectFile, 'r') as fh:
+        resurrectEpochTime = fh.read()
+
+    #match resurrectEpochTime to regex for [0-9] for epochTimeStamp
+    #if fail:
+    #   print("{0} does not match the expected format.  It is either corrupt or intentionally empty".format(myResurrectFile))
+    #   sys.exit(0)
+
+    if timeDelta >= resurrectEpochTime:
+        #enable_puppet()
+        #empty myResurrectFile
+        with open(myResurrectFile, 'w') as fh:
+            fh.write('')
+        print "Resurrecting puppetd."
+    else:
+       sys.exit(0)
+
+
+#################
+#Parse Arguments#
+#################
+#metavar ='' is a quick hack to remove the redundant allcaps argument
+parser = argparse.ArgumentParser(description='puppet command line wrapper with extended functionality')
+
+#I prefer add.argument to position args, even though
+# subparser=parser.add_subparser
+# myParser = subparser.add_parser('cmd'); myParser.add_argument('...') does some cool stuff
+
+parser.add_argument('-v', '--version', action="store_true", help='show script version and exit')
+parser.add_argument('--agent',action="store_true",help=argparse.SUPPRESS)
+
+group = parser.add_mutually_exclusive_group()
+group.add_argument('--disable', nargs=1, metavar='disable message', help="disables the host\'s puppet agent and updates /etc/motd.  must be followed by a string or quoted group of strings")
+group.add_argument('--enable', action="store_true", help='enables the host\'s puppet agent')
+
+#nargs for timeout
+parser.add_argument('--timeout', nargs='?', default=1, metavar='integer', help='specify the number of days before resuming puppet.  [defaults to 1]',type=int)
+args = parser.parse_args()
+
+
+if args.version:
+    show_version()
+if args.disable:
+    if args.timeout > 1:
+        disable_puppet(args.disable[0],myHost,args.timeout)
+    else:
+        disable_puppet(args.disable,myHost,1)
+if args.enable:
+    enable_puppet()
+if args.agent:
+    agent()
+
